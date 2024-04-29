@@ -2191,13 +2191,14 @@ static errno_t copyfile_set_bsdflags(copyfile_state_t s, const uint32_t new_flag
  * callers should propagate, and ENOTSUP where this routine refuses to copy the source file.
  * In this final case, callers are free to attempt a full copy.
  */
-static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_t output_blk_size)
+static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_t output_blk_size, size_t input_hole_blk_size, size_t output_hole_blk_size)
 {
 	int src_fd = s->src_fd, dst_fd = s->dst_fd, rc = 0;
 	off_t src_start, dst_start, src_size = s->sb.st_size;
 	off_t first_hole_offset, next_hole_offset, current_src_offset, next_src_offset;
 	ssize_t nread;
-	size_t iosize = MIN(input_blk_size, output_blk_size);
+	size_t iosize = MIN(input_hole_blk_size, output_hole_blk_size);
+	size_t bsize = MIN(input_blk_size, output_blk_size);
 	copyfile_callback_t status = s->statuscb;
 	char *bp = NULL;
 	bool use_punchhole = true;
@@ -2220,7 +2221,7 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 	// we only punch holes if we can guarantee that all holes from the source can
 	// be holes in the destination, which requires that the source filesystem's block size
 	// be an integral multiple of the destination filesystem's block size.
-	if (input_blk_size % output_blk_size != 0) {
+	if (input_hole_blk_size % output_hole_blk_size != 0) {
 		use_punchhole = false;
 	}
 
@@ -2281,6 +2282,25 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 		goto error_exit;
 	}
 
+	// Find the next area of src_fd to copy.
+	// Since data sections can be any length, we need see if current_src_offset points
+	// at a hole.
+	// If we get ENXIO, we're done copying (the last part of the file was a data section).
+	// If this is not a hole, we do not need to alter current_src_offset yet.
+	// If this is a hole, then we need to look for the next data section.
+	next_hole_offset = lseek(src_fd, current_src_offset, SEEK_HOLE);
+	if (next_hole_offset == -1 || next_hole_offset == current_src_offset) {
+		if (errno != ENXIO || next_hole_offset == current_src_offset) {
+			copyfile_warn("unable to find next hole in file");
+			goto error_exit;
+		}
+	}
+
+	// Move pointer back
+	if (lseek(src_fd, current_src_offset, SEEK_SET) == -1) {
+		goto error_exit;
+	}
+
 	// Now, current_src_offset points at the start of src's first data region.
 	// Update dst_fd to point to the same offset (respecting its start).
 	if (lseek(dst_fd, dst_start + current_src_offset - src_start, SEEK_SET) == -1) {
@@ -2289,7 +2309,7 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 	}
 
 	// Allocate a temporary buffer to copy data sections into.
-	bp = malloc(iosize);
+	bp = malloc(bsize);
 	if (bp == NULL) {
 		copyfile_warn("No memory for copy buffer");
 		goto error_exit;
@@ -2301,7 +2321,7 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 	 * Then, write those bytes to the dest fd, using the same iosize.
 	 * Finally, update our source and dest fds to point to the next data section.
 	 */
-	while ((nread = read(src_fd, bp, iosize)) > 0) {
+	while ((nread = read(src_fd, bp, bsize)) > 0) {
 		ssize_t nwritten;
 		size_t left = nread;
 		void *ptr = bp;
@@ -2349,24 +2369,12 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 		}
 		current_src_offset += nread;
 
-		// Find the next area of src_fd to copy.
-		// Since data sections can be any length, we need see if current_src_offset points
-		// at a hole.
-		// If we get ENXIO, we're done copying (the last part of the file was a data section).
-		// If this is not a hole, we do not need to alter current_src_offset yet.
-		// If this is a hole, then we need to look for the next data section.
-		next_hole_offset = lseek(src_fd, current_src_offset, SEEK_HOLE);
-		if (next_hole_offset == -1) {
-			if (errno == ENXIO) {
-				break; // We're done copying data sections.
-			}
-			copyfile_warn("unable to find next hole in file during copy");
+		if (nread < 0) {
 			goto error_exit;
-		} else if (next_hole_offset != current_src_offset) {
-			// Keep copying this data section (we must rewind src_fd to current_src_offset).
-			if (lseek(src_fd, current_src_offset, SEEK_SET) == -1) {
-				goto error_exit;
-			}
+		} else if (nread == 0) {
+			break; // We're done copying data sections.
+		} else if (next_hole_offset == -1 || next_hole_offset > current_src_offset) {
+			// Keep copying this data section
 			continue;
 		}
 
@@ -2379,6 +2387,20 @@ static int copyfile_data_sparse(copyfile_state_t s, size_t input_blk_size, size_
 			}
 
 			copyfile_warn("unable to advance src to next data section");
+			goto error_exit;
+		}
+
+		// Get the next hole
+		next_hole_offset = lseek(src_fd, next_src_offset, SEEK_HOLE);
+		if (next_hole_offset == -1 || next_hole_offset == next_src_offset) {
+			if (errno != ENXIO || next_hole_offset == next_src_offset) {
+				copyfile_warn("unable to find next hole in file");
+				goto error_exit;
+			}
+		}
+
+		// Move pointer back
+		if (lseek(src_fd, next_src_offset, SEEK_SET) == -1) {
 			goto error_exit;
 		}
 
@@ -2598,7 +2620,7 @@ static int copyfile_data(copyfile_state_t s)
 		if (iMinblocksize > 0 && oMinblocksize > 0 && (size_t) min_hole_size >= iMinblocksize
 			&& (size_t) min_hole_size >= oMinblocksize) {
 			// Do the copy.
-			ret = copyfile_data_sparse(s, iMinblocksize, oMinblocksize);
+			ret = copyfile_data_sparse(s, iBlocksize, oBlocksize, iMinblocksize, oMinblocksize);
 
 			// If we returned an error, exit gracefully.
 			// If sparse copying is not supported, we try full copying if allowed by our caller.
