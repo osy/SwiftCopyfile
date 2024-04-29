@@ -14,10 +14,10 @@ try await CopyManager.default.copyItem(at: srcURL, to: dstURL, flags: [.all, .re
 
 ```swift
 let startTime = Date()
-try await CopyManager.default.copyItem(at: srcURL, to: dstURL) { srcPath, dstPath, bytesCopied in
+for try await progress in CopyManager.default.copyItemProgress(at: srcURL, to: dstURL, flags: [.all, .recursive, .clone, .dataSparse]) {
     let elapsed = Date().timeIntervalSince(startTime)
-    let speed = Double(bytesCopied) / elapsed / 1048576
-    print("\(speed) MB/s (copied \(bytesCopied) bytes)")
+    let speed = Double(progress.bytesCopied) / elapsed / 1048576
+    print("\(speed) MB/s (copied \(progress.bytesCopied) bytes)")
 }
 ```
 

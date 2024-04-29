@@ -18,12 +18,12 @@ import CCopyfile
 import Foundation
 
 public class CopyManager {
-    /// Callback to handle copy progress
+    /// Tuple representing an update in the progress.
     /// - Parameters:
     ///   - srcPath: The path to the file or directory that the copy manager wants to copy. If unavailable, it will be nil.
     ///   - dstPath: The new path for the copied file or directory. If unavailable, it will be nil.
     ///   - bytesCopied: The total number of bytes copied so far.
-    public typealias ProgressCallback = (_ srcPath: String?, _ dstPath: String?, _ bytesCopied: Int64) -> Void
+    public typealias Progress = (srcPath: String?, dstPath: String?, bytesCopied: Int64)
 
     public struct Flags: OptionSet {
         public let rawValue: Int32
@@ -173,43 +173,46 @@ public class CopyManager {
 }
 
 public extension CopyManager {
-    /// Copies the file at the specified URL to a new location.
+    /// Copies the file at the specified URL to a new location with progress updates.
     ///
     /// If the manager's `delegate` is set, it will be invoked before a file is copied as well as during an error.
     /// - Parameters:
     ///   - srcURL: The file URL that identifies the file you want to copy.
     ///   - dstURL: The URL at which to place the copy of `srcURL`.
     ///   - flags: Additional options.
-    ///   - onProgress: Optional callback which is invoked each time a block is written.
-    func copyItem(at srcURL: URL, to dstURL: URL, flags: Flags = [.all, .recursive], onProgress: ProgressCallback? = nil) async throws {
-        try await withCopyfile({ copyfile(srcURL.path, dstURL.path, $0, flags.copyfileFlags)}, onProgress: onProgress)
+    /// - Returns: Asynchronous stream which yields progress updates.
+    func copyItemProgress(at srcURL: URL, to dstURL: URL, flags: Flags = [.all, .recursive]) -> AsyncThrowingStream<Progress, Error> {
+        withCopyfileProgress({ copyfile(srcURL.path, dstURL.path, $0, flags.copyfileFlags)})
     }
     
-    /// Copies the data from a file handle to another file handle.
+    /// Copies the data from a file handle to another file handle with progress updates.
     ///
     /// If the manager's `delegate` is set, it will be invoked before a file is copied as well as during an error.
     /// - Parameters:
     ///   - srcHandle: A file handle open for reading which the data will come from.
     ///   - dstHandle: A file handle open for writing where the data will go to.
     ///   - flags: Additional options.
-    ///   - onProgress: Optional callback which is invoked each time a block is written.
-    func copyFileHandle(at srcHandle: FileHandle, to dstHandle: FileHandle, flags: Flags = [.all, .recursive], onProgress: ProgressCallback? = nil) async throws {
-        try await withCopyfile({ fcopyfile(srcHandle.fileDescriptor, dstHandle.fileDescriptor, $0, flags.copyfileFlags)}, onProgress: onProgress)
+    /// - Returns: Asynchronous stream which yields progress updates.
+    func copyFileHandleProgress(at srcHandle: FileHandle, to dstHandle: FileHandle, flags: Flags = [.all, .recursive]) -> AsyncThrowingStream<Progress, Error> {
+        withCopyfileProgress({ fcopyfile(srcHandle.fileDescriptor, dstHandle.fileDescriptor, $0, flags.copyfileFlags)})
     }
 
-    private func withCopyfile(_ docopyfile: @escaping (copyfile_state_t) -> Int32, onProgress: ProgressCallback?) async throws {
+    private func withCopyfileProgress(_ docopyfile: @escaping (copyfile_state_t) -> Int32) -> AsyncThrowingStream<Progress, Error> {
         class CopyStatusContext {
             let manager: CopyManager
-            let progresCallback: ProgressCallback?
+            let continuation: AsyncThrowingStream<Progress, Error>.Continuation
+            var isCancelled: Bool = false
 
-            init(manager: CopyManager, progresCallback: ProgressCallback?) {
+            init(manager: CopyManager, continuation: AsyncThrowingStream<Progress, Error>.Continuation) {
                 self.manager = manager
-                self.progresCallback = progresCallback
+                self.continuation = continuation
             }
         }
-        let context = CopyStatusContext(manager: self, progresCallback: onProgress)
         let callback: copyfile_callback_t = { (what, stage, state, src, dst, ctx) -> Int32 in
             let context = Unmanaged<CopyStatusContext>.fromOpaque(ctx!).takeUnretainedValue()
+            guard !context.isCancelled else {
+                return COPYFILE_QUIT
+            }
             let srcPath: String?
             let dstPath: String?
             if let src = src {
@@ -245,17 +248,18 @@ public extension CopyManager {
             if what == COPYFILE_COPY_DATA && stage == COPYFILE_PROGRESS {
                 var copied: off_t = 0
                 copyfile_state_get(state, UInt32(COPYFILE_STATE_COPIED), &copied)
-                context.progresCallback?(srcPath, dstPath, copied)
+                context.continuation.yield((srcPath, dstPath, copied))
             }
             return COPYFILE_CONTINUE
         }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+        return AsyncThrowingStream { continuation in
             ioQueue.async {
                 let s = copyfile_state_alloc()
                 guard s != nil else {
-                    continuation.resume(throwing: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOMEM)))
+                    continuation.finish(throwing: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOMEM)))
                     return
                 }
+                let context = CopyStatusContext(manager: self, continuation: continuation)
                 let ctx = Unmanaged.passRetained(context)
                 defer {
                     copyfile_state_free(s)
@@ -263,12 +267,41 @@ public extension CopyManager {
                 }
                 copyfile_state_set(s, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(callback, to: UnsafeRawPointer.self))
                 copyfile_state_set(s, UInt32(COPYFILE_STATE_STATUS_CTX), ctx.toOpaque())
+                continuation.onTermination = { type in
+                    if case .cancelled = type {
+                        context.isCancelled = true
+                    }
+                }
                 if docopyfile(s!) < 0 {
-                    continuation.resume(throwing: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
+                    continuation.finish(throwing: NSError(domain: NSPOSIXErrorDomain, code: Int(errno)))
                 } else {
-                    continuation.resume()
+                    continuation.finish()
                 }
             }
         }
+    }
+}
+
+public extension CopyManager {
+    /// Copies the file at the specified URL to a new location.
+    ///
+    /// If the manager's `delegate` is set, it will be invoked before a file is copied as well as during an error.
+    /// - Parameters:
+    ///   - srcURL: The file URL that identifies the file you want to copy.
+    ///   - dstURL: The URL at which to place the copy of `srcURL`.
+    ///   - flags: Additional options.
+    func copyItem(at srcURL: URL, to dstURL: URL, flags: Flags = [.all, .recursive]) async throws {
+        try await copyItemProgress(at: srcURL, to: dstURL, flags: flags).reduce(Void(), { _, _  in Void() })
+    }
+
+    /// Copies the data from a file handle to another file handle.
+    ///
+    /// If the manager's `delegate` is set, it will be invoked before a file is copied as well as during an error.
+    /// - Parameters:
+    ///   - srcHandle: A file handle open for reading which the data will come from.
+    ///   - dstHandle: A file handle open for writing where the data will go to.
+    ///   - flags: Additional options.
+    func copyFileHandle(at srcHandle: FileHandle, to dstHandle: FileHandle, flags: Flags = [.all, .recursive]) async throws {
+        try await copyFileHandleProgress(at: srcHandle, to: dstHandle, flags: flags).reduce(Void(), { _, _  in Void() })
     }
 }
