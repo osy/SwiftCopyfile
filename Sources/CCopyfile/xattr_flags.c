@@ -34,7 +34,6 @@
 #include <sys/xattr.h>
 #include <dispatch/dispatch.h>
 //#include <xpc/private.h>
-extern bool _xpc_runtime_is_app_sandboxed(void);
 
 #define FLAG_DELIM_CHAR	'#'
 #define FLAG_DELIM_STR "#"
@@ -160,11 +159,11 @@ nameInDefaultList(const char *eaname)
 	static dispatch_once_t onceToken;
     
 	dispatch_once(&onceToken, ^{
-		if (_xpc_runtime_is_app_sandboxed()) {
+		//if (_xpc_runtime_is_app_sandboxed()) {
 			defaultPropertyTable = defaultSandboxedPropertyTable;
-		} else {
-			defaultPropertyTable = defaultUnboxedPropertyTable;
-		}
+		//} else {
+		//	defaultPropertyTable = defaultUnboxedPropertyTable;
+		//}
 	});
 
 	for (retval = defaultPropertyTable; retval->eaName; retval++) {
