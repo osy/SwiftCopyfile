@@ -90,9 +90,9 @@ typedef int (*copyfile_callback_t)(int, int, copyfile_state_t, const char *__uns
 #define COPYFILE_XATTR	    (1<<2)
 #define COPYFILE_DATA	    (1<<3)
 
-#define COPYFILE_SECURITY   (COPYFILE_STAT | COPYFILE_ACL)
-#define COPYFILE_METADATA   (COPYFILE_SECURITY | COPYFILE_XATTR)
-#define COPYFILE_ALL	    (COPYFILE_METADATA | COPYFILE_DATA)
+#define COPYFILE_SECURITY   (3)//(COPYFILE_STAT | COPYFILE_ACL)
+#define COPYFILE_METADATA   (7)//(COPYFILE_SECURITY | COPYFILE_XATTR)
+#define COPYFILE_ALL	    (15)//(COPYFILE_METADATA | COPYFILE_DATA)
 
 #define	COPYFILE_RECURSIVE	(1<<15)	/* Descend into hierarchies */
 #define COPYFILE_CHECK		(1<<16) /* return flags for xattr or acls if set */
@@ -101,7 +101,7 @@ typedef int (*copyfile_callback_t)(int, int, copyfile_state_t, const char *__uns
 #define COPYFILE_NOFOLLOW_DST	(1<<19) /* don't follow if dst is a symlink */
 #define COPYFILE_MOVE		(1<<20) /* unlink src after copy */
 #define COPYFILE_UNLINK		(1<<21) /* unlink dst before copy */
-#define COPYFILE_NOFOLLOW	(COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST)
+#define COPYFILE_NOFOLLOW	(786432)//(COPYFILE_NOFOLLOW_SRC | COPYFILE_NOFOLLOW_DST)
 
 #define COPYFILE_PACK		(1<<22)
 #define COPYFILE_UNPACK		(1<<23)
